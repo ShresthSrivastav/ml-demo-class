@@ -27,7 +27,7 @@ Streamlit Community Cloud has resource limits that can change, and inactive apps
 
 ## Run locally
 
-Use Python 3.12, then install the tested dependencies and start the app:
+Use Python 3.14.10 to match the current Community Cloud deployment, then install the tested dependencies and start the app:
 
 ```bash
 python -m venv .venv
@@ -58,6 +58,6 @@ For one-person access, open the app's settings in Community Cloud, go to **Shari
 - Live app: [ml-demo-class-2s4jjxd8rwzktnpi9mylbc.streamlit.app](https://ml-demo-class-2s4jjxd8rwzktnpi9mylbc.streamlit.app/)
 - Entrypoint: `app.py`
 - Branch: `main`
-- Python version: 3.12 (Community Cloud's current default)
+- Python version: 3.14.10 (current deployment runtime)
 
 Community Cloud deploys updates from GitHub after changes are pushed to the selected branch. See the [deployment guide](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy).
