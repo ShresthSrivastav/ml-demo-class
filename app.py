@@ -4,7 +4,11 @@ import io
 import hashlib
 import json
 import math
+import csv
+import gzip
+import re
 import warnings
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -50,8 +54,6 @@ from sklearn.model_selection import KFold, StratifiedKFold, cross_validate, trai
 from sklearn.inspection import permutation_importance
 
 
-st.set_page_config(page_title="ML Studio", page_icon="ðŸ§ª", layout="wide")
-
 TASKS = [
     "Classification",
     "Regression",
@@ -89,7 +91,7 @@ UNSUPERVISED_MODELS = {
 
 TASK_LESSONS = {
     "Classification": "Predict a category. Accuracy is the fraction correct, but can hide rare-class failures. Macro F1 weights classes equally; weighted F1 weights them by frequency. Check per-class recall and the confusion matrix.",
-    "Regression": "Predict a numeric value. MAE is average absolute error in target units; RMSE penalizes large misses more; RÂ² compares with a mean-value baseline. Inspect residuals for patterns the metrics hide.",
+    "Regression": "Predict a numeric value. MAE is average absolute error in target units; RMSE penalizes large misses more; R² compares with a mean-value baseline. Inspect residuals for patterns the metrics hide.",
     "Clustering": "Group rows without using a target. Cluster IDs are arbitrary names, not ranks. Silhouette measures separation without labels; optional known labels report ARI/NMI for external evaluation only. ARI is chance-adjusted; NMI is not.",
     "Dimensionality reduction": "Compress features into fewer components. PCA preserves as much variance as possible at each step; explained variance describes information retained, not prediction accuracy.",
     "Anomaly detection": "Find rows unlike the majority. A flagged row needs investigation, not automatic deletion. The contamination setting controls the expected fraction flagged; anomaly scores are not probabilities.",
@@ -149,6 +151,12 @@ DEMO_TASKS = {
 }
 MAX_DENSE_FEATURE_CELLS = 5_000_000
 MAX_AGGLOMERATIVE_ROWS = 5_000
+MAX_SLOW_KERNEL_ROWS = 10_000
+MAX_DENSITY_MODEL_ROWS = 15_000
+MAX_NEIGHBOR_ROWS = 20_000
+MAX_MODELS_PER_RUN = 4
+MAX_COMPARISON_UPLOAD_BYTES = 40 * 1024 * 1024
+MAX_OUTPUT_PREVIEW_ROWS = 5_000
 
 
 @st.cache_data(scope="session", max_entries=4, show_spinner=False)
@@ -196,7 +204,7 @@ def make_demo_dataset(name: str) -> pd.DataFrame:
 def render_learning_guide(task: str, models: list[str] | None = None) -> None:
     st.info(TASK_LESSONS[task])
     with st.expander("Teacher notes: how to interpret this run"):
-        st.markdown("**Workflow:** inspect the data â†’ define the question â†’ choose inputs â†’ fit the model â†’ evaluate on data the model did not train on.")
+        st.markdown("**Workflow:** inspect the data → define the question → choose inputs → fit the model → evaluate on data the model did not train on.")
         st.markdown("**Important:** a high score is not proof of causation or fairness. Check leakage, class balance, data quality, and whether the test data resembles the intended real-world use.")
         st.markdown("**Try this experiment**")
         for exercise in TASK_EXERCISES[task]:
@@ -214,18 +222,119 @@ def read_csv(uploaded_file) -> pd.DataFrame:
     return frame
 
 
-@st.cache_data(scope="session", ttl=1800, max_entries=8, show_spinner=False)
-def _parse_csv(cache_key: str, _raw: bytes) -> pd.DataFrame:
-    # The digest keys the cache; the underscore avoids hashing the upload bytes a second time.
+def safe_file_stem(name: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("._")
+    return stem[:80] or "dataset"
+
+
+def prepare_row_download(output: pd.DataFrame, seed: int) -> tuple[pd.DataFrame, bytes, str, str]:
+    """Keep a small preview in session state and stream large CSV exports through gzip."""
+    preview = output
+    if len(output) > MAX_OUTPUT_PREVIEW_ROWS:
+        preview = output.sample(MAX_OUTPUT_PREVIEW_ROWS, random_state=seed)
+    preview = preview.copy()
+    estimated_bytes = int(output.memory_usage(index=True, deep=True).sum())
+    if estimated_bytes <= 5 * 1024 * 1024:
+        payload = output.to_csv(index=False).encode("utf-8")
+        return preview, payload, ".csv", "text/csv"
+
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb", compresslevel=6, mtime=0) as compressed:
+        with io.TextIOWrapper(compressed, encoding="utf-8", newline="") as text_file:
+            output.to_csv(text_file, index=False, chunksize=10_000)
+    return preview, buffer.getvalue(), ".csv.gz", "application/gzip"
+
+
+def build_markdown_report(runs: list[dict], title: str = "ML Studio run report") -> str:
+    """Create a lightweight, portable record of run settings and results."""
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    lines = [f"# {title}", "", f"Generated: {timestamp}", ""]
+    for run in runs:
+        name = str(run.get("name", "Dataset")).replace("|", "\\|")
+        config = run.get("config", {})
+        lines.extend([f"## {name}", ""])
+        if run.get("error"):
+            lines.extend([f"Run error: {run['error']}", ""])
+            continue
+
+        if config.get("task") in ("Classification", "Regression"):
+            split_text = f"{1 - config.get('test_fraction', 0):.0%} / {config.get('test_fraction', 0):.0%}"
+        else:
+            split_text = "Not used"
+        settings = config.get("settings", {})
+        setting_text = ", ".join(f"{key}={value}" for key, value in settings.items() if key != "random_state") or "Defaults"
+        metadata = [
+            ("Task", config.get("task", "Not recorded")),
+            ("Target", config.get("target") or "None"),
+            ("Known labels for external evaluation", config.get("evaluation_label") or "None"),
+            ("Features", ", ".join(map(str, config.get("features", []))) or "None"),
+            ("Models", ", ".join(map(str, config.get("models", []))) or "None"),
+            ("Train/test", split_text),
+            ("Cross-validation folds", config.get("cv_folds", 0) or "Not used"),
+            ("Permutation importance", "Enabled" if config.get("explain_features") else "Disabled"),
+            ("Random seed", settings.get("random_state", 42)),
+            ("Model settings", setting_text),
+        ]
+        for label, value in metadata:
+            escaped_value = str(value).replace("|", "\\|")
+            lines.append(f"- **{label}:** {escaped_value}")
+        lines.append("")
+
+        for bundle in run.get("bundles", []):
+            if bundle.get("note"):
+                lines.extend([f"Note: {bundle['note']}", ""])
+            for result in bundle.get("results", []):
+                lines.extend([f"### {result['model']}", ""])
+                if result.get("error"):
+                    lines.extend([f"Error: {result['error']}", ""])
+                    continue
+                metrics = result.get("metrics", {})
+                if metrics:
+                    lines.extend(["| Metric | Value |", "| --- | ---: |"])
+                    for metric, value in metrics.items():
+                        if isinstance(value, (float, np.floating)):
+                            value = "Not defined" if not np.isfinite(value) else f"{value:.6g}"
+                        escaped_metric = str(metric).replace("|", "\\|")
+                        escaped_value = str(value).replace("|", "\\|")
+                        lines.append(f"| {escaped_metric} | {escaped_value} |")
+                    lines.append("")
+    lines.extend(["---", "Preprocessing is fit on training folds/splits for supervised runs. Results are educational estimates, not guarantees of real-world performance.", ""])
+    return "\n".join(lines)
+
+
+def parse_csv_bytes(raw: bytes) -> pd.DataFrame:
+    """Parse and validate CSV bytes without depending on Streamlit session state."""
+    encoding = "utf-8-sig"
     try:
-        frame = pd.read_csv(io.BytesIO(_raw))
+        with io.TextIOWrapper(io.BytesIO(raw), encoding=encoding, newline="") as text_file:
+            header = next(csv.reader(text_file), [])
     except UnicodeDecodeError:
-        frame = pd.read_csv(io.BytesIO(_raw), encoding="latin-1")
+        encoding = "latin-1"
+        with io.TextIOWrapper(io.BytesIO(raw), encoding=encoding, newline="") as text_file:
+            header = next(csv.reader(text_file), [])
+    if not header or all(not str(column).strip() for column in header):
+        raise ValueError("This CSV needs a header row with at least one named column.")
+    if len(header) != len(set(header)):
+        raise ValueError("The CSV contains duplicate column names. Rename them and upload again.")
+    if any(not str(column).strip() for column in header):
+        raise ValueError("Every CSV column needs a name. Rename blank headers and upload again.")
+    try:
+        frame = pd.read_csv(io.BytesIO(raw), encoding=encoding)
+    except UnicodeDecodeError:
+        if encoding == "latin-1":
+            raise
+        frame = pd.read_csv(io.BytesIO(raw), encoding="latin-1")
     if frame.empty or len(frame.columns) == 0:
         raise ValueError("This CSV has no rows or columns.")
     if frame.columns.duplicated().any():
         raise ValueError("The CSV contains duplicate column names. Rename them and upload again.")
     return frame
+
+
+@st.cache_data(scope="session", ttl=1800, max_entries=8, show_spinner=False)
+def _parse_csv(cache_key: str, _raw: bytes) -> pd.DataFrame:
+    # The digest keys the cache; the underscore avoids hashing the upload bytes a second time.
+    return parse_csv_bytes(_raw)
 
 
 @st.cache_data(scope="session", max_entries=8, show_spinner=False)
@@ -285,7 +394,7 @@ def _numeric_histogram(cache_key: str, _frame: pd.DataFrame, column: str) -> pd.
     if values.empty:
         return pd.DataFrame()
     counts, edges = np.histogram(values, bins=min(20, max(5, int(np.sqrt(len(values))))))
-    labels = [f"{edges[i]:.3g}â€“{edges[i + 1]:.3g}" for i in range(len(counts))]
+    labels = [f"{edges[i]:.3g}–{edges[i + 1]:.3g}" for i in range(len(counts))]
     return pd.DataFrame({"Rows": counts}, index=labels)
 
 
@@ -323,7 +432,7 @@ def choose_features(frame: pd.DataFrame, target: str | None, key: str, excluded:
     exclude_ids = False
     if likely_ids:
         exclude_ids = st.checkbox(
-            f"Exclude likely ID columns ({', '.join(map(str, likely_ids[:5]))}{'â€¦' if len(likely_ids) > 5 else ''})",
+            f"Exclude likely ID columns ({', '.join(map(str, likely_ids[:5]))}{'…' if len(likely_ids) > 5 else ''})",
             value=True,
             help="Unique row identifiers usually add noise rather than predictive information. Turn this off if the ID itself has meaning.",
             key=f"{key}_exclude_ids",
@@ -391,6 +500,7 @@ def check_dense_capacity(frame: pd.DataFrame, columns: list[str], rows: int, mod
 
 def build_supervised_model(task: str, name: str, settings: dict | None = None):
     settings = settings or {}
+    random_state = settings.get("random_state", 42)
     max_depth = settings.get("max_depth")
     n_estimators = settings.get("n_estimators", 150)
     neighbors = settings.get("neighbors", 5)
@@ -399,10 +509,10 @@ def build_supervised_model(task: str, name: str, settings: dict | None = None):
     if task == "Classification":
         models = {
             "Logistic Regression": (LogisticRegression(C=regularization, max_iter=1000), False),
-            "Decision Tree": (DecisionTreeClassifier(max_depth=max_depth, random_state=42), False),
-            "Random Forest": (RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=42), False),
-            "Extra Trees": (ExtraTreesClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=42), False),
-            "Gradient Boosting": (GradientBoostingClassifier(n_estimators=n_estimators, max_depth=max_depth or 3, random_state=42), True),
+            "Decision Tree": (DecisionTreeClassifier(max_depth=max_depth, random_state=random_state), False),
+            "Random Forest": (RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=random_state), False),
+            "Extra Trees": (ExtraTreesClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=random_state), False),
+            "Gradient Boosting": (GradientBoostingClassifier(n_estimators=n_estimators, max_depth=max_depth or 3, random_state=random_state), True),
             "K-Nearest Neighbors": (KNeighborsClassifier(n_neighbors=neighbors), False),
             "Support Vector Machine": (SVC(C=regularization), False),
             "Gaussian Naive Bayes": (GaussianNB(), True),
@@ -412,10 +522,10 @@ def build_supervised_model(task: str, name: str, settings: dict | None = None):
             "Linear Regression": (LinearRegression(), False),
             "Ridge": (Ridge(alpha=alpha), False),
             "Lasso": (Lasso(alpha=alpha, max_iter=5000), False),
-            "Decision Tree": (DecisionTreeRegressor(max_depth=max_depth, random_state=42), False),
-            "Random Forest": (RandomForestRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=42), False),
-            "Extra Trees": (ExtraTreesRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=42), False),
-            "Gradient Boosting": (GradientBoostingRegressor(n_estimators=n_estimators, max_depth=max_depth or 3, random_state=42), True),
+            "Decision Tree": (DecisionTreeRegressor(max_depth=max_depth, random_state=random_state), False),
+            "Random Forest": (RandomForestRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=random_state), False),
+            "Extra Trees": (ExtraTreesRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=random_state), False),
+            "Gradient Boosting": (GradientBoostingRegressor(n_estimators=n_estimators, max_depth=max_depth or 3, random_state=random_state), True),
             "K-Nearest Neighbors": (KNeighborsRegressor(n_neighbors=neighbors), False),
             "Support Vector Regression": (SVR(C=regularization), False),
         }
@@ -435,9 +545,11 @@ def run_supervised(
 ) -> list[dict]:
     if not features:
         raise ValueError("Choose at least one input feature.")
+    seed = (model_settings or {}).get("random_state", 42)
     data = frame.loc[frame[target].notna(), features + [target]].copy()
     if task == "Regression":
-        data = data[np.isfinite(pd.to_numeric(data[target], errors="coerce"))]
+        data[target] = pd.to_numeric(data[target], errors="coerce")
+        data = data[np.isfinite(data[target])]
     if len(data) < 4:
         raise ValueError("At least four rows with a non-missing target are needed for a train/test split.")
     X = data[features].replace([np.inf, -np.inf], np.nan)
@@ -463,11 +575,14 @@ def run_supervised(
             X,
             y,
             test_size=test_fraction,
-            random_state=42,
+            random_state=seed,
             stratify=stratify,
         )
     except ValueError as exc:
         raise ValueError(f"The selected train/test split is not possible: {exc}") from exc
+
+    if task == "Classification" and y_train.nunique() < 2:
+        raise ValueError("The training split contains only one class. Add more examples of each class or choose a larger training set.")
 
     results = []
     baseline = DummyClassifier(strategy="most_frequent") if task == "Classification" else DummyRegressor(strategy="mean")
@@ -482,18 +597,38 @@ def run_supervised(
         }
     else:
         baseline_metrics = {
-            "Test RÂ²": r2_score(y_test, baseline_prediction) if len(y_test) > 1 else np.nan,
+            "Test R²": r2_score(y_test, baseline_prediction) if len(y_test) > 1 else np.nan,
             "Test MAE": mean_absolute_error(y_test, baseline_prediction),
             "Test RMSE": mean_squared_error(y_test, baseline_prediction) ** 0.5,
         }
+    baseline_output = pd.DataFrame({"Actual": y_test, "Predicted": baseline_prediction}, index=y_test.index)
+    if task == "Regression":
+        baseline_output["Residual"] = y_test - baseline_prediction
+    baseline_output = baseline_output.reset_index(names="Original row")
+    preview, download_data, download_suffix, download_mime = prepare_row_download(baseline_output, seed)
     results.append({
         "model": "Baseline (most frequent class)" if task == "Classification" else "Baseline (predict the mean)",
         "metrics": baseline_metrics,
-        "details": {"output": pd.DataFrame({"Actual": y_test, "Predicted": baseline_prediction}, index=y_test.index).reset_index(names="Original row")},
+        "details": {
+            "output": preview,
+            "output_rows": len(baseline_output),
+            "download_data": download_data,
+            "download_suffix": download_suffix,
+            "download_mime": download_mime,
+        },
         "error": None,
     })
 
     for name in model_names:
+        if name == "Support Vector Machine" and len(X_train) > MAX_SLOW_KERNEL_ROWS:
+            results.append({"model": name, "metrics": {}, "details": {}, "error": f"Limited to {MAX_SLOW_KERNEL_ROWS:,} training rows on the free tier because kernel SVM can become very slow."})
+            continue
+        if name == "Support Vector Regression" and len(X_train) > MAX_SLOW_KERNEL_ROWS:
+            results.append({"model": name, "metrics": {}, "details": {}, "error": f"Limited to {MAX_SLOW_KERNEL_ROWS:,} training rows on the free tier because kernel SVR can become very slow."})
+            continue
+        if name == "K-Nearest Neighbors" and len(X_train) > MAX_NEIGHBOR_ROWS:
+            results.append({"model": name, "metrics": {}, "details": {}, "error": f"Limited to {MAX_NEIGHBOR_ROWS:,} training rows on the free tier to keep neighbor predictions responsive."})
+            continue
         estimator, dense = build_supervised_model(task, name, model_settings)
         pipeline = Pipeline(
             [
@@ -510,7 +645,7 @@ def run_supervised(
                     if task == "Classification":
                         smallest_class = int(y_train.value_counts().min())
                         actual_folds = min(cv_folds, smallest_class)
-                        cv = StratifiedKFold(n_splits=actual_folds, shuffle=True, random_state=42) if actual_folds >= 2 else None
+                        cv = StratifiedKFold(n_splits=actual_folds, shuffle=True, random_state=seed) if actual_folds >= 2 else None
                         scoring = {
                             "accuracy": "accuracy",
                             "balanced_accuracy": "balanced_accuracy",
@@ -519,7 +654,7 @@ def run_supervised(
                         }
                     else:
                         actual_folds = min(cv_folds, len(y_train))
-                        cv = KFold(n_splits=actual_folds, shuffle=True, random_state=42) if actual_folds >= 2 else None
+                        cv = KFold(n_splits=actual_folds, shuffle=True, random_state=seed) if actual_folds >= 2 else None
                         scoring = {"r2": "r2", "mae": "neg_mean_absolute_error", "rmse": "neg_root_mean_squared_error"}
                     if cv is not None:
                         cv_result = cross_validate(pipeline, X_train, y_train, cv=cv, scoring=scoring, n_jobs=1, error_score="raise")
@@ -549,8 +684,8 @@ def run_supervised(
                 details = {"confusion_matrix": matrix, "classification_report": report}
             else:
                 metrics = {
-                    "Train RÂ²": r2_score(y_train, train_prediction) if len(y_train) > 1 else np.nan,
-                    "Test RÂ²": r2_score(y_test, prediction) if len(y_test) > 1 else np.nan,
+                    "Train R²": r2_score(y_train, train_prediction) if len(y_train) > 1 else np.nan,
+                    "Test R²": r2_score(y_test, prediction) if len(y_test) > 1 else np.nan,
                     "Test MAE": mean_absolute_error(y_test, prediction),
                     "Test RMSE": mean_squared_error(y_test, prediction) ** 0.5,
                 }
@@ -568,7 +703,7 @@ def run_supervised(
                             "balanced_accuracy": "Balanced accuracy",
                             "macro_f1": "Macro F1",
                             "weighted_f1": "Weighted F1",
-                            "r2": "RÂ²",
+                            "r2": "R²",
                             "mae": "MAE",
                             "rmse": "RMSE",
                         }[metric]
@@ -579,21 +714,36 @@ def run_supervised(
             output = pd.DataFrame({"Actual": y_test, "Predicted": prediction}, index=y_test.index)
             if task == "Regression":
                 output["Residual"] = y_test - prediction
-            details["output"] = output.reset_index(names="Original row")
+            output = output.reset_index(names="Original row")
+            preview, download_data, download_suffix, download_mime = prepare_row_download(output, seed)
+            details.update({
+                "output": preview,
+                "output_rows": len(output),
+                "download_data": download_data,
+                "download_suffix": download_suffix,
+                "download_mime": download_mime,
+            })
             if explain_features:
                 scoring_name = "f1_weighted" if task == "Classification" else "neg_mean_absolute_error"
+                importance_X = X_test
+                importance_y = y_test
+                importance_sampled = len(importance_X) > 5_000
+                if len(importance_X) > 5_000:
+                    importance_X = importance_X.sample(5_000, random_state=seed)
+                    importance_y = y_test.loc[importance_X.index]
                 importance = permutation_importance(
                     pipeline,
-                    X_test,
-                    y_test,
+                    importance_X,
+                    importance_y,
                     scoring=scoring_name,
                     n_repeats=3,
-                    random_state=42,
+                    random_state=seed,
                     n_jobs=1,
                 )
                 details["feature_importance"] = pd.DataFrame(
                     {"Feature": features, "Importance": importance.importances_mean}
                 ).sort_values("Importance", ascending=False)
+                details["importance_sampled"] = importance_sampled
             results.append({"model": name, "metrics": metrics, "details": details, "error": None})
         except Exception as exc:  # report one model's incompatibility without losing other results
             results.append({"model": name, "metrics": {}, "details": {}, "error": str(exc)})
@@ -605,10 +755,10 @@ def cluster_model(name: str, settings: dict):
         return DBSCAN(eps=settings["eps"], min_samples=settings["min_samples"]), False
     clusters = settings["clusters"]
     if name == "K-Means":
-        return KMeans(n_clusters=clusters, n_init=10, random_state=42), False
+        return KMeans(n_clusters=clusters, n_init=10, random_state=settings.get("random_state", 42)), False
     if name == "Agglomerative Clustering":
         return AgglomerativeClustering(n_clusters=clusters), True
-    return GaussianMixture(n_components=clusters, random_state=42, n_init=3), True
+    return GaussianMixture(n_components=clusters, random_state=settings.get("random_state", 42), n_init=3), True
 
 
 def run_unsupervised(
@@ -624,6 +774,7 @@ def run_unsupervised(
     X = frame[features].replace([np.inf, -np.inf], np.nan)
     if len(X) < 2:
         raise ValueError("At least two rows are needed for unsupervised learning.")
+    seed = settings.get("random_state", 42)
     results = []
     for name in model_names:
         try:
@@ -631,6 +782,8 @@ def run_unsupervised(
                 estimator, dense = cluster_model(name, settings)
                 if name == "Agglomerative Clustering" and len(X) > MAX_AGGLOMERATIVE_ROWS:
                     raise ValueError(f"Agglomerative Clustering is limited to {MAX_AGGLOMERATIVE_ROWS:,} rows because it grows quadratically with dataset size.")
+                if name == "DBSCAN" and len(X) > MAX_DENSITY_MODEL_ROWS:
+                    raise ValueError(f"DBSCAN is limited to {MAX_DENSITY_MODEL_ROWS:,} rows in this free-tier app to keep memory use predictable.")
                 if dense:
                     check_dense_capacity(frame, features, len(X), name)
                 transformed = make_preprocessor(frame, features, dense=dense).fit_transform(X)
@@ -663,7 +816,7 @@ def run_unsupervised(
                             score_features,
                             score_labels,
                             sample_size=min(5000, len(score_labels)),
-                            random_state=42,
+                            random_state=seed,
                         )
                         metrics["Silhouette score"] = score
                     except ValueError:
@@ -677,7 +830,7 @@ def run_unsupervised(
                 transformed = make_preprocessor(frame, features, dense=True).fit_transform(X)
                 max_components = min(transformed.shape[0], transformed.shape[1])
                 components = min(max(1, settings["components"]), max_components)
-                estimator = PCA(n_components=components, random_state=42)
+                estimator = PCA(n_components=components, random_state=seed)
                 projection = estimator.fit_transform(transformed)
                 component_names = [f"PC{i + 1}" for i in range(projection.shape[1])]
                 output = pd.DataFrame(projection, columns=component_names)
@@ -693,11 +846,13 @@ def run_unsupervised(
             else:
                 contamination = settings["contamination"]
                 estimator = (
-                    IsolationForest(contamination=contamination, random_state=42)
+                    IsolationForest(contamination=contamination, random_state=seed)
                     if name == "Isolation Forest"
                     else LocalOutlierFactor(contamination=contamination)
                 )
                 if name == "Local Outlier Factor":
+                    if len(X) > MAX_DENSITY_MODEL_ROWS:
+                        raise ValueError(f"Local Outlier Factor is limited to {MAX_DENSITY_MODEL_ROWS:,} rows in this free-tier app to keep memory use predictable.")
                     check_dense_capacity(frame, features, len(X), name)
                 transformed = make_preprocessor(frame, features, dense=name == "Local Outlier Factor").fit_transform(X)
                 labels = estimator.fit_predict(transformed)
@@ -718,6 +873,16 @@ def run_unsupervised(
                 details = {"output": output.reset_index(names="Original row")}
                 if len(scatter_columns) == 2:
                     details["scatter_columns"] = scatter_columns
+            output = details["output"]
+            output = output.reset_index(names="Original row") if "Original row" not in output.columns else output
+            preview, download_data, download_suffix, download_mime = prepare_row_download(output, seed)
+            details.update({
+                "output": preview,
+                "output_rows": len(output),
+                "download_data": download_data,
+                "download_suffix": download_suffix,
+                "download_mime": download_mime,
+            })
             results.append({"model": name, "metrics": metrics, "details": details, "error": None})
         except Exception as exc:
             results.append({"model": name, "metrics": {}, "details": {}, "error": str(exc)})
@@ -736,6 +901,8 @@ def run_models(
     explain_features: bool = False,
     evaluation_label: str | None = None,
 ) -> list[dict]:
+    if len(models) > MAX_MODELS_PER_RUN:
+        raise ValueError(f"Choose up to {MAX_MODELS_PER_RUN} models per dataset in one run to keep the free-tier app responsive.")
     if task in ("Classification", "Regression"):
         if not target:
             raise ValueError("Choose a target column for supervised learning.")
@@ -762,8 +929,12 @@ def render_eda(frame: pd.DataFrame, target: str | None, task: str | None, key: s
         st.caption("Summary statistics and correlations use a reproducible sample of up to 50,000 rows; distribution charts use up to 100,000 rows for speed.")
 
     warnings_to_show = []
-    if len(frame) > 25_000:
-        warnings_to_show.append("Large dataset: SVM, KNN, DBSCAN, and Agglomerative Clustering can be slow. Start with one model or a smaller teaching sample.")
+    if len(frame) > MAX_SLOW_KERNEL_ROWS:
+        warnings_to_show.append(
+            f"Free-tier runtime limits: kernel SVM/SVR up to {MAX_SLOW_KERNEL_ROWS:,} training rows, KNN up to {MAX_NEIGHBOR_ROWS:,}, "
+            f"DBSCAN/Local Outlier Factor up to {MAX_DENSITY_MODEL_ROWS:,}, and Agglomerative Clustering up to {MAX_AGGLOMERATIVE_ROWS:,}. "
+            "Use a smaller teaching sample or choose a faster model if a limit is reached."
+        )
     missing_columns = profile["schema"].loc[profile["schema"]["Missing %"] >= 30, "Column"].tolist()
     if missing_columns:
         warnings_to_show.append(f"High missingness (30% or more): {', '.join(map(str, missing_columns[:8]))}.")
@@ -784,12 +955,12 @@ def render_eda(frame: pd.DataFrame, target: str | None, task: str | None, key: s
             if len(counts) > 1 and counts.min() / counts.max() < 0.2:
                 warnings_to_show.append("The target is imbalanced. Accuracy alone may be misleading; compare macro and weighted F1 and per-class recall.")
     if warnings_to_show:
-        with st.expander("Data quality checks â€” review before training", expanded=True):
+        with st.expander("Data quality checks — review before training", expanded=True):
             for note in warnings_to_show:
                 st.warning(note)
     if task in ("Classification", "Regression"):
         st.info("Teaching note: the app splits rows before learning imputers, encoders, and scalers. Keep the test set untouched until the final evaluation to avoid data leakage.")
-        st.caption("Runs are reproducible: random splits and randomized models use seed 42.")
+        st.caption("Runs use the seed selected in the settings below. Keep the seed and model settings to repeat a run.")
 
     with st.expander("Questions for students"):
         st.markdown("- Which columns have missing values, duplicates, or almost no variation?")
@@ -866,34 +1037,46 @@ def render_results(dataset_name: str, bundles: list[dict], key_prefix: str) -> l
                     st.dataframe(result["details"]["confusion_matrix"], width="stretch")
                     st.markdown("**Per-class precision, recall, and F1**")
                     st.dataframe(result["details"]["classification_report"], width="stretch")
-                if "Train accuracy" in result["metrics"] or "Train RÂ²" in result["metrics"]:
+                if "Train accuracy" in result["metrics"] or "Train R²" in result["metrics"]:
                     st.caption("Train scores describe fit to examples the model saw. Test scores estimate performance on held-out examples. A large gap can indicate overfitting.")
                 output = result["details"].get("output")
                 if "explained_variance" in result["details"]:
                     st.markdown("**Variance retained by each PCA component**")
                     st.bar_chart(result["details"]["explained_variance"])
                 if output is not None:
+                    output_rows = result["details"].get("output_rows", len(output))
+                    if output_rows > len(output):
+                        st.caption(f"Showing a repeatable sample of {len(output):,} of {output_rows:,} result rows. Download the full file below.")
                     st.dataframe(output.head(100), width="stretch")
                     scatter_columns = result["details"].get("scatter_columns")
                     color_column = "Cluster" if "Cluster" in output.columns else "Result" if "Result" in output.columns else None
                     if scatter_columns and color_column:
                         st.scatter_chart(output, x=scatter_columns[0], y=scatter_columns[1], color=color_column)
                     if "Residual" in output.columns:
-                        st.markdown("**Residuals (actual âˆ’ predicted)**")
+                        st.markdown("**Residuals (actual − predicted)**")
                         st.scatter_chart(output, x="Predicted", y="Residual")
                     if {"PC1", "PC2"}.issubset(output.columns):
                         st.scatter_chart(output, x="PC1", y="PC2")
+                    download_data = result["details"].get("download_data")
+                    if download_data is None:
+                        download_data = output.to_csv(index=False).encode("utf-8")
                     st.download_button(
                         "Download row-level results",
-                        data=output.to_csv(index=False).encode("utf-8"),
-                        file_name=f"{dataset_name.replace(' ', '_')}_{result['model'].lower().replace(' ', '_')}_results.csv",
-                        mime="text/csv",
+                        data=download_data,
+                        file_name=f"{safe_file_stem(dataset_name)}_{safe_file_stem(result['model'])}_results{result['details'].get('download_suffix', '.csv')}",
+                        mime=result["details"].get("download_mime", "text/csv"),
                         key=f"download_{key_prefix}_{len(flattened)}",
                     )
                 if "feature_importance" in result["details"]:
                     st.markdown("**Permutation feature importance**")
                     st.caption("This measures how much the held-out score changes when one input column is shuffled. It is model-specific and does not prove causation.")
+                    if result["details"].get("importance_sampled"):
+                        st.caption("For speed, importance used a repeatable sample of up to 5,000 held-out rows.")
                     st.dataframe(result["details"]["feature_importance"].head(15), hide_index=True, width="stretch")
+    if flattened:
+        st.markdown("**Model comparison for this dataset**")
+        comparison = pd.DataFrame(flattened).drop(columns=["Dataset"])
+        st.dataframe(comparison, hide_index=True, width="stretch")
     return flattened
 
 
@@ -924,7 +1107,7 @@ def evaluation_controls(task: str, key: str) -> tuple[int, bool]:
         return 0, False
     cv_folds = st.selectbox(
         "Compare reliability",
-        options=[0, 3, 5, 10],
+        options=[0, 3, 5],
         index=0,
         format_func=lambda value: "Holdout only (fast)" if value == 0 else f"{value}-fold CV on training data + final holdout",
         help="Cross-validation helps compare models using several training folds. The final test set remains untouched.",
@@ -933,10 +1116,22 @@ def evaluation_controls(task: str, key: str) -> tuple[int, bool]:
     explain_features = st.checkbox(
         "Calculate permutation feature importance (slower)",
         value=False,
-        help="Shuffle each original input column on held-out rows to show how the score changes. This is model-specific, not causal.",
+        help="Shuffle each original input column on held-out rows to show how the score changes. Uses at most 5,000 held-out rows, is model-specific, and does not prove causation.",
         key=f"{key}_permutation_importance",
     )
     return cv_folds, explain_features
+
+
+def reproducibility_control(key: str) -> int:
+    return int(st.number_input(
+        "Random seed",
+        min_value=0,
+        max_value=2_147_483_647,
+        value=42,
+        step=1,
+        help="Use the same seed and settings to repeat the split and randomized models.",
+        key=f"{key}_random_seed",
+    ))
 
 
 def supervised_controls(models: list[str], rows: int, key: str) -> dict:
@@ -998,6 +1193,11 @@ def model_controls(task: str, models: list[str], rows: int, key: str) -> dict:
     return task_controls(task, models, rows, key)
 
 
+def clear_session_data() -> None:
+    st.cache_data.clear()
+    st.session_state.clear()
+
+
 def render_single_dataset() -> None:
     source = st.radio("Start with", ["Upload a CSV", "Try a learning example"], horizontal=True, key="single_source")
     dataset_name = ""
@@ -1053,29 +1253,33 @@ def render_single_dataset() -> None:
     if task in ("Classification", "Regression"):
         test_fraction = st.slider("Test set size", 10, 50, 20, 5, key="single_test_split") / 100
     cv_folds, explain_features = evaluation_controls(task, "single_evaluation")
+    random_seed = reproducibility_control("single")
     settings = model_controls(task, models, len(frame), "single_settings") if models else {}
+    settings["random_state"] = random_seed
+    if len(models) > MAX_MODELS_PER_RUN:
+        st.warning(f"Choose at most {MAX_MODELS_PER_RUN} models per run to keep the free-tier app responsive.")
     result_key = "single_saved_results"
+    run_config = {
+        "task": task,
+        "target": target,
+        "evaluation_label": evaluation_label,
+        "features": features,
+        "models": models,
+        "test_fraction": test_fraction,
+        "settings": settings,
+        "cv_folds": cv_folds,
+        "explain_features": explain_features,
+    }
     signature = config_signature(
         frame,
-        {
-            "dataset_name": dataset_name,
-            "task": task,
-            "target": target,
-            "evaluation_label": evaluation_label,
-            "features": features,
-            "models": models,
-            "test_fraction": test_fraction,
-            "settings": settings,
-            "cv_folds": cv_folds,
-            "explain_features": explain_features,
-        },
+        {"dataset_name": dataset_name, **run_config},
     )
-    if st.button("Run selected model(s)", type="primary", key="single_run"):
+    if st.button("Run selected model(s)", type="primary", key="single_run", disabled=len(models) > MAX_MODELS_PER_RUN):
         if not models:
             st.error("Select at least one model.")
         else:
             try:
-                with st.spinner(f"Training {len(models)} model(s)â€¦"):
+                with st.spinner(f"Training {len(models)} model(s)…"):
                     bundles = run_models(
                         frame,
                         task,
@@ -1088,12 +1292,20 @@ def render_single_dataset() -> None:
                         explain_features,
                         evaluation_label,
                     )
-                st.session_state[result_key] = {"signature": signature, "name": dataset_name, "bundles": bundles}
+                st.session_state[result_key] = {"signature": signature, "name": dataset_name, "config": run_config, "bundles": bundles}
             except Exception as exc:
                 st.error(str(exc))
     saved = st.session_state.get(result_key)
     if saved and saved["signature"] == signature:
         render_results(saved["name"], saved["bundles"], "single")
+        report = build_markdown_report([saved], title="ML Studio run report")
+        st.download_button(
+            "Download run report (.md)",
+            data=report.encode("utf-8"),
+            file_name=f"{safe_file_stem(saved['name'])}_ml_report.md",
+            mime="text/markdown",
+            key="download_single_report",
+        )
         if st.button("Clear saved results", key="single_clear_results"):
             del st.session_state[result_key]
             st.rerun()
@@ -1109,7 +1321,7 @@ def render_dataset_configuration(upload, index: int, mode: str, shared_task: str
         return None
 
     key = f"compare_{index}_{frame.attrs.get('mlstudio_cache_key', '')[:12]}"
-    with st.expander(f"{upload.name} â€” {len(frame):,} rows Ã— {len(frame.columns):,} columns", expanded=index == 0):
+    with st.expander(f"{upload.name} — {len(frame):,} rows × {len(frame.columns):,} columns", expanded=index == 0):
         task = shared_task or st.selectbox("Task", TASKS, key=f"{key}_task")
         target = None
         if task in ("Classification", "Regression"):
@@ -1143,7 +1355,11 @@ def render_dataset_configuration(upload, index: int, mode: str, shared_task: str
         if task in ("Classification", "Regression"):
             test_fraction = st.slider("Test set size", 10, 50, 20, 5, key=f"{key}_split") / 100
         cv_folds, explain_features = evaluation_controls(task, f"{key}_evaluation")
+        random_seed = reproducibility_control(key)
         settings = model_controls(task, models, len(frame), f"{key}_settings") if models else {}
+        settings["random_state"] = random_seed
+        if len(models) > MAX_MODELS_PER_RUN:
+            st.warning(f"Choose at most {MAX_MODELS_PER_RUN} models for this dataset in one run.")
     return {
         "name": upload.name.rsplit(".", 1)[0],
         "frame": frame,
@@ -1172,6 +1388,10 @@ def render_comparison() -> None:
         return
     if len(uploads) > 4:
         st.error("Compare up to four datasets at a time to keep memory and model runtimes predictable.")
+        return
+    total_upload_bytes = sum(upload.size for upload in uploads)
+    if total_upload_bytes > MAX_COMPARISON_UPLOAD_BYTES:
+        st.error(f"The combined comparison upload limit is {MAX_COMPARISON_UPLOAD_BYTES // (1024 * 1024)} MB. Remove files or use smaller samples to protect free-tier memory.")
         return
     mode = st.radio(
         "Comparison mode",
@@ -1217,7 +1437,10 @@ def render_comparison() -> None:
         ).encode("utf-8")
     ).hexdigest()
     result_key = "compare_saved_results"
-    if st.button("Run comparison", type="primary", key="compare_run"):
+    too_many_models = any(len(config["models"]) > MAX_MODELS_PER_RUN for config in configs)
+    if too_many_models:
+        st.warning(f"Choose at most {MAX_MODELS_PER_RUN} models per dataset before running the comparison.")
+    if st.button("Run comparison", type="primary", key="compare_run", disabled=too_many_models):
         if len(configs) < 2:
             st.error("At least two readable CSV files are required.")
             return
@@ -1227,7 +1450,7 @@ def render_comparison() -> None:
                 saved_runs.append({"name": config["name"], "error": "Select at least one model.", "bundles": []})
                 continue
             try:
-                with st.spinner(f"Training models for {config['name']}â€¦"):
+                with st.spinner(f"Training models for {config['name']}…"):
                     bundles = run_models(
                         config["frame"],
                         config["task"],
@@ -1240,7 +1463,18 @@ def render_comparison() -> None:
                         config["explain_features"],
                         config["evaluation_label"],
                     )
-                saved_runs.append({"name": config["name"], "error": None, "bundles": bundles, "key": f"compare_{index}"})
+                run_config = {
+                    "task": config["task"],
+                    "target": config["target"],
+                    "evaluation_label": config["evaluation_label"],
+                    "features": config["features"],
+                    "models": config["models"],
+                    "test_fraction": config["test_fraction"],
+                    "settings": config["settings"],
+                    "cv_folds": config["cv_folds"],
+                    "explain_features": config["explain_features"],
+                }
+                saved_runs.append({"name": config["name"], "config": run_config, "error": None, "bundles": bundles, "key": f"compare_{index}"})
             except Exception as exc:
                 saved_runs.append({"name": config["name"], "error": str(exc), "bundles": []})
         st.session_state[result_key] = {"signature": signature, "runs": saved_runs}
@@ -1255,16 +1489,23 @@ def render_comparison() -> None:
                 continue
             all_rows.extend(render_results(run["name"], run["bundles"], run["key"]))
         if all_rows:
-            st.markdown("### Per-dataset comparison summary")
             summary = pd.DataFrame(all_rows)
-            st.dataframe(summary, hide_index=True, width="stretch")
             st.download_button(
-                "Download comparison metrics",
+                "Download per-dataset metrics (CSV)",
                 data=summary.to_csv(index=False).encode("utf-8"),
                 file_name="model_comparison.csv",
                 mime="text/csv",
                 key="download_comparison_summary",
             )
+            st.caption("The CSV keeps each dataset in its own row and does not average scores across datasets. On-screen model summaries are shown separately under each dataset.")
+        report = build_markdown_report(saved["runs"], title="ML Studio dataset comparison report")
+        st.download_button(
+            "Download comparison report (.md)",
+            data=report.encode("utf-8"),
+            file_name="ml_dataset_comparison_report.md",
+            mime="text/markdown",
+            key="download_comparison_report",
+        )
         if st.button("Clear saved comparison", key="compare_clear_results"):
             del st.session_state[result_key]
             st.rerun()
@@ -1272,11 +1513,30 @@ def render_comparison() -> None:
         st.info("Comparison settings changed since the last run. Run the comparison again to refresh these results.")
 
 
-st.title("ðŸ§ª ML Studio")
-st.caption("A guided, in-memory lab for exploring data, learning ML ideas, and comparing models.")
-st.markdown("**Learning path:** 1. Inspect data â†’ 2. choose the task and inputs â†’ 3. train â†’ 4. explain the results.")
-workspace = st.radio("Choose a workspace", ["Single dataset", "Compare datasets"], horizontal=True, key="workspace")
-if workspace == "Single dataset":
-    render_single_dataset()
-else:
-    render_comparison()
+def main() -> None:
+    st.set_page_config(page_title="ML Studio", page_icon="🧪", layout="wide")
+    with st.sidebar:
+        st.markdown("## Personal workspace")
+        st.caption("Uploads and results stay in this active session; the app does not write them to storage.")
+        st.button(
+            "Clear uploads, cache, and results",
+            key="reset_session",
+            on_click=clear_session_data,
+            width="stretch",
+        )
+        st.divider()
+        st.markdown("### Access and privacy")
+        st.info("For one-person use, set **Who can view this app** to **Only specific people** in Streamlit Cloud settings. A public app link is open to anyone, and a public GitHub repository keeps the source visible.")
+
+    st.title("🧪 ML Studio")
+    st.caption("A guided, in-memory lab for exploring data, learning ML ideas, and comparing models.")
+    st.markdown("**Learning path:** 1. Inspect data → 2. choose the task and inputs → 3. train → 4. explain the results.")
+    workspace = st.radio("Choose a workspace", ["Single dataset", "Compare datasets"], horizontal=True, key="workspace")
+    if workspace == "Single dataset":
+        render_single_dataset()
+    else:
+        render_comparison()
+
+
+if __name__ == "__main__":
+    main()
