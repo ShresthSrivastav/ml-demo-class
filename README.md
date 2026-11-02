@@ -27,7 +27,7 @@ The app reads uploads in memory and does not save uploaded data. Do not use the 
 
 ## Deploy on Streamlit Community Cloud
 
-1. Push this folder to a public GitHub repository named `ml-demo-class`.
-2. Sign in at [Streamlit Community Cloud](https://share.streamlit.io/) and connect GitHub.
+1. The source is published at [ShresthSrivastav/ml-demo-class](https://github.com/ShresthSrivastav/ml-demo-class).
+2. Sign in at [Streamlit Community Cloud](https://share.streamlit.io/) and connect GitHub if prompted.
 3. Create an app from the repository, using `app.py` as the app file.
 4. Deploy. The public app URL can be shared with anyone.
