@@ -9,7 +9,9 @@ import gzip
 import re
 import warnings
 from datetime import datetime
+from itertools import combinations
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -157,6 +159,12 @@ MAX_NEIGHBOR_ROWS = 20_000
 MAX_MODELS_PER_RUN = 4
 MAX_COMPARISON_UPLOAD_BYTES = 40 * 1024 * 1024
 MAX_OUTPUT_PREVIEW_ROWS = 5_000
+MAX_EDA_PLOT_ROWS = 5_000
+MAX_PAIRWISE_PLOT_ROWS = 2_000
+MAX_CORRELATION_COLUMNS = 20
+MAX_MISSINGNESS_PLOT_ROWS = 100
+MAX_MISSINGNESS_CHART_COLUMNS = 50
+MAX_CATEGORY_LEVELS = 10
 
 
 @st.cache_data(scope="session", max_entries=4, show_spinner=False)
@@ -355,17 +363,113 @@ def _eda_profile(cache_key: str, _frame: pd.DataFrame) -> dict:
     )
     likely_ids = likely_identifier_columns(_frame, sample, unique)
     constants = [column for column in _frame.columns if _frame[column].nunique(dropna=True) <= 1]
-    correlations = sample[numeric[:30]].corr(numeric_only=True).round(2) if numeric else pd.DataFrame()
     return {
         "schema": schema,
         "summary": sample.describe(include="all").transpose(),
-        "correlations": correlations,
         "likely_ids": likely_ids,
         "constants": constants,
         "sampled": len(sample) < len(_frame),
         "missing_cells": int(_frame.isna().sum().sum()),
         "duplicates": int(_frame.duplicated().sum()),
     }
+
+
+@st.cache_data(scope="session", max_entries=32, show_spinner=False)
+def _eda_sample(cache_key: str, _frame: pd.DataFrame, columns: tuple, limit: int = MAX_EDA_PLOT_ROWS, seed: int = 42) -> pd.DataFrame:
+    return bounded_frame_sample(_frame, columns, limit, seed)
+
+
+def bounded_frame_sample(frame: pd.DataFrame, columns: tuple | list, limit: int = MAX_EDA_PLOT_ROWS, seed: int = 42) -> pd.DataFrame:
+    selected = list(columns)
+    sample = frame.loc[:, selected]
+    if len(sample) > limit:
+        sample = sample.sample(limit, random_state=seed)
+    return sample.replace([np.inf, -np.inf], np.nan)
+
+
+def missingness_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    missing = frame.isna().sum()
+    return pd.DataFrame({"Column": missing.index.astype(str), "Missing rows": missing.to_numpy(), "Missing %": (missing / max(1, len(frame)) * 100).to_numpy()})
+
+
+def histogram_data(frame: pd.DataFrame, column: str, bins: int = 20, limit: int = MAX_EDA_PLOT_ROWS, seed: int = 42) -> pd.DataFrame:
+    values = pd.to_numeric(frame[column], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if len(values) > limit:
+        values = values.sample(limit, random_state=seed)
+    if values.empty:
+        return pd.DataFrame(columns=["bin_start", "bin_end", "rows"])
+    counts, edges = np.histogram(values, bins=max(1, min(int(bins), 50)))
+    return pd.DataFrame({"bin_start": edges[:-1], "bin_end": edges[1:], "rows": counts})
+
+
+def category_count_data(frame: pd.DataFrame, column: str, limit: int = MAX_CATEGORY_LEVELS, row_limit: int = MAX_EDA_PLOT_ROWS, seed: int = 42) -> pd.DataFrame:
+    values = frame[column]
+    if len(values) > row_limit:
+        values = values.sample(row_limit, random_state=seed)
+    counts = values.fillna("(missing)").astype(str).value_counts()
+    top = counts.head(limit)
+    if len(counts) > limit:
+        top.loc["Other categories"] = int(counts.iloc[limit:].sum())
+    return top.rename_axis("category").reset_index(name="rows")
+
+
+def correlation_data(frame: pd.DataFrame, columns: list[str], limit: int = MAX_CORRELATION_COLUMNS, row_limit: int = MAX_EDA_PLOT_ROWS, seed: int = 42) -> pd.DataFrame:
+    selected = [column for column in columns if column in frame and pd.api.types.is_numeric_dtype(frame[column])][:limit]
+    if len(selected) < 2:
+        return pd.DataFrame(columns=["x", "y", "correlation"])
+    sample = frame[selected]
+    if len(sample) > row_limit:
+        sample = sample.sample(row_limit, random_state=seed)
+    correlations = sample.replace([np.inf, -np.inf], np.nan).corr(numeric_only=True)
+    result = pd.DataFrame(
+        [(str(x), str(y), correlations.loc[y, x]) for x in correlations.columns for y in correlations.index],
+        columns=["x", "y", "correlation"],
+    )
+    return result.dropna(subset=["correlation"])
+
+
+def missingness_pattern_data(frame: pd.DataFrame, columns: list[str], limit: int = MAX_MISSINGNESS_PLOT_ROWS, max_columns: int = MAX_CORRELATION_COLUMNS, seed: int = 42) -> pd.DataFrame:
+    selected = list(columns)[:max_columns]
+    if not selected:
+        return pd.DataFrame(columns=["row", "column", "missing"])
+    sample = frame[selected]
+    if len(sample) > limit:
+        sample = sample.sample(limit, random_state=seed)
+    pattern = sample.isna().copy()
+    pattern.index = np.arange(len(pattern))
+    pattern.index.name = "row"
+    return pattern.rename_axis(columns="column").reset_index().melt(id_vars="row", var_name="column", value_name="missing")
+
+
+def category_relationship_data(frame: pd.DataFrame, x: str, y: str, limit: int = MAX_CATEGORY_LEVELS, row_limit: int = MAX_EDA_PLOT_ROWS, seed: int = 42) -> pd.DataFrame:
+    sample = frame[[x, y]]
+    if len(sample) > row_limit:
+        sample = sample.sample(row_limit, random_state=seed)
+    result = sample.copy()
+    result.columns = ["x", "y"]
+    result = result.fillna("(missing)").astype(str)
+    for column in ("x", "y"):
+        top = result[column].value_counts().head(limit).index
+        result.loc[~result[column].isin(top), column] = "Other categories"
+    return result.groupby(["x", "y"], observed=True).size().reset_index(name="rows")
+
+
+def numeric_category_sample(frame: pd.DataFrame, numeric: str, category: str, row_limit: int = MAX_EDA_PLOT_ROWS, seed: int = 42) -> pd.DataFrame:
+    sample = frame[[numeric, category]]
+    if len(sample) > row_limit:
+        sample = sample.sample(row_limit, random_state=seed)
+    sample = sample.rename(columns={numeric: "value", category: "category"}).copy()
+    sample["value"] = pd.to_numeric(sample["value"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    sample["category"] = sample["category"].fillna("(missing)").astype(str)
+    top = sample["category"].value_counts().head(MAX_CATEGORY_LEVELS).index
+    sample.loc[~sample["category"].isin(top), "category"] = "Other categories"
+    return sample.dropna(subset=["value"])
+
+
+def pairwise_pairs(columns: list[str]) -> list[tuple[str, str]]:
+    if len(columns) > 4:
+        raise ValueError("Choose at most four numeric columns for pairwise exploration.")
+    return list(combinations(columns, 2))
 
 
 def likely_identifier_columns(frame: pd.DataFrame, sample: pd.DataFrame | None = None, unique: pd.Series | None = None) -> list[str]:
@@ -384,26 +488,6 @@ def likely_identifier_columns(frame: pd.DataFrame, sample: pd.DataFrame | None =
             )
         )
     ]
-
-
-@st.cache_data(scope="session", max_entries=64, show_spinner=False)
-def _numeric_histogram(cache_key: str, _frame: pd.DataFrame, column: str) -> pd.DataFrame:
-    values = pd.to_numeric(_frame[column], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    if len(values) > 100_000:
-        values = values.sample(100_000, random_state=42)
-    if values.empty:
-        return pd.DataFrame()
-    counts, edges = np.histogram(values, bins=min(20, max(5, int(np.sqrt(len(values))))))
-    labels = [f"{edges[i]:.3g}–{edges[i + 1]:.3g}" for i in range(len(counts))]
-    return pd.DataFrame({"Rows": counts}, index=labels)
-
-
-@st.cache_data(scope="session", max_entries=64, show_spinner=False)
-def _category_counts(cache_key: str, _frame: pd.DataFrame, column: str) -> pd.Series:
-    values = _frame[column]
-    if len(values) > 100_000:
-        values = values.sample(100_000, random_state=42)
-    return values.fillna("(missing)").astype(str).value_counts().head(20).rename("Rows")
 
 
 def available_models(task: str) -> list[str]:
@@ -822,7 +906,10 @@ def run_unsupervised(
                     except ValueError:
                         metrics["Silhouette score"] = np.nan
                 scatter_columns = [column for column in features if pd.api.types.is_numeric_dtype(frame[column])][:2]
-                details = {"output": output.reset_index(names="Original row")}
+                details = {
+                    "output": output.reset_index(names="Original row"),
+                    "cluster_sizes": pd.Series(labels).astype(str).value_counts().rename_axis("Cluster").reset_index(name="Rows"),
+                }
                 if len(scatter_columns) == 2:
                     details["scatter_columns"] = scatter_columns
             elif task == "Dimensionality reduction":
@@ -839,8 +926,11 @@ def run_unsupervised(
                 details = {
                     "output": output,
                     "explained_variance": pd.DataFrame(
-                        {"Explained variance ratio": estimator.explained_variance_ratio_},
-                        index=component_names,
+                        {
+                            "Component": component_names,
+                            "Explained variance ratio": estimator.explained_variance_ratio_,
+                            "Cumulative variance": np.cumsum(estimator.explained_variance_ratio_),
+                        },
                     ),
                 }
             else:
@@ -916,6 +1006,116 @@ def config_signature(frame: pd.DataFrame, config: dict) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _histogram_chart(data: pd.DataFrame, title: str, height: int = 280):
+    return alt.Chart(data).mark_bar().encode(
+        x=alt.X("bin_start:Q", title=title), x2="bin_end:Q", y=alt.Y("rows:Q", title="Rows"),
+        tooltip=[alt.Tooltip("bin_start:Q", title="From", format=".3g"), alt.Tooltip("bin_end:Q", title="To", format=".3g"), "rows:Q"],
+    ).properties(height=height)
+
+
+def _scatter_chart(data: pd.DataFrame, x: str, y: str, color: str | None, title: str, height: int = 320):
+    encodings = {
+        "x": alt.X(f"{x}:Q", title=x), "y": alt.Y(f"{y}:Q", title=y),
+        "tooltip": [alt.Tooltip(f"{x}:Q", format=".3g"), alt.Tooltip(f"{y}:Q", format=".3g")],
+    }
+    if color and color in data:
+        encodings["color"] = alt.Color(f"{color}:N", title=color)
+        encodings["tooltip"].append(alt.Tooltip(f"{color}:N", title=color))
+    return alt.Chart(data).mark_circle(size=45, opacity=0.65).encode(**encodings).properties(title=title, height=height)
+
+
+def _render_correlation(frame: pd.DataFrame, columns: list[str], key: str, height: int = 420) -> None:
+    sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, tuple(columns))
+    data = correlation_data(sample, columns)
+    if data.empty:
+        st.info("Choose at least two numeric columns with usable values to calculate correlations.")
+        return
+    chart = alt.Chart(data).mark_rect().encode(
+        x=alt.X("x:O", title=None), y=alt.Y("y:O", title=None),
+        color=alt.Color("correlation:Q", scale=alt.Scale(domain=[-1, 1], scheme="redblue"), title="Pearson r"),
+        tooltip=["x:O", "y:O", alt.Tooltip("correlation:Q", format=".2f")],
+    ).properties(height=height)
+    st.altair_chart(chart, width="stretch", key=key)
+    st.caption("How to read: values near +1 move together linearly; values near −1 move in opposite directions; values near 0 have little linear association. Correlation does not establish causation.")
+
+
+def _render_missingness(frame: pd.DataFrame, key: str) -> None:
+    summary = missingness_summary(frame).query("`Missing rows` > 0").sort_values("Missing %", ascending=False)
+    if summary.empty:
+        st.success("No missing values found.")
+        return
+    if len(summary) > MAX_MISSINGNESS_CHART_COLUMNS:
+        summary = summary.head(MAX_MISSINGNESS_CHART_COLUMNS)
+        st.caption(f"Showing the {MAX_MISSINGNESS_CHART_COLUMNS} columns with the highest missingness.")
+    chart = alt.Chart(summary).mark_bar().encode(
+        x=alt.X("Missing %:Q", title="Missing rows (%)"),
+        y=alt.Y("Column:N", sort="-x", title=None),
+        tooltip=["Column:N", "Missing rows:Q", alt.Tooltip("Missing %:Q", format=".1f")],
+        color=alt.Color("Missing %:Q", scale=alt.Scale(scheme="orangered"), legend=None),
+    ).properties(height=min(400, 24 * len(summary) + 40))
+    st.altair_chart(chart, width="stretch", key=key)
+    st.caption("How to read: each bar is the share of rows absent from that column. Consider whether missingness itself may carry information before choosing an imputation strategy.")
+
+
+def _render_target_charts(frame: pd.DataFrame, target: str | None, task: str | None, numeric: list[str], categorical: list[str], key: str) -> None:
+    if not target or target not in frame:
+        return
+    st.markdown(f"**Target exploration: {target}**")
+    if task == "Classification":
+        target_frame = frame.dropna(subset=[target])
+        target_sample = _eda_sample(target_frame.attrs.get("mlstudio_cache_key", key), target_frame, (target,))
+        counts = category_count_data(target_sample, target)
+        chart = alt.Chart(counts).mark_bar().encode(
+            x=alt.X("category:N", sort="-y", title=target), y=alt.Y("rows:Q", title="Rows"),
+            color=alt.Color("category:N", legend=None), tooltip=["category:N", "rows:Q"],
+        ).properties(height=280)
+        st.altair_chart(chart, width="stretch", key=f"{key}_balance")
+        st.caption("How to read: compare class counts before training. Rare classes can be hard to learn; accuracy can hide poor performance on them.")
+        features = [column for column in numeric if column != target]
+        if features:
+            feature = st.selectbox("Numeric feature to compare across classes", features, key=f"{key}_class_feature")
+            sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, (feature, target))
+            data = numeric_category_sample(sample, feature, target)
+            if data.empty:
+                st.info("No finite feature values are available for this class comparison.")
+            else:
+                box = alt.Chart(data).mark_boxplot().encode(
+                    x=alt.X("category:N", title=target), y=alt.Y("value:Q", title=feature),
+                    color=alt.Color("category:N", legend=None), tooltip=["category:N", alt.Tooltip("value:Q", format=".3g")],
+                ).properties(height=300)
+                st.altair_chart(box, width="stretch", key=f"{key}_class_box")
+                st.caption("How to read: compare medians and spread for this one feature across classes. This view is descriptive; it does not show model importance or prove causation.")
+        else:
+            features = [column for column in categorical if column != target]
+            if features:
+                feature = st.selectbox("Categorical feature to compare with classes", features, key=f"{key}_class_cat_feature")
+                sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, (feature, target))
+                relation = category_relationship_data(sample, feature, target)
+                chart = alt.Chart(relation).mark_rect().encode(
+                    x=alt.X("x:O", title=feature), y=alt.Y("y:O", title=target),
+                    color=alt.Color("rows:Q", title="Rows"), tooltip=["x:O", "y:O", "rows:Q"],
+                ).properties(height=260)
+                st.altair_chart(chart, width="stretch", key=f"{key}_class_category")
+    elif task == "Regression":
+        sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, (target,))
+        target_hist = histogram_data(sample, target)
+        if not target_hist.empty:
+            st.altair_chart(_histogram_chart(target_hist, target), width="stretch", key=f"{key}_target_hist")
+            st.caption("How to read: inspect skew and extreme values; a long tail can make average-error measures sensitive to large misses.")
+        else:
+            st.info("The selected target has no finite numeric values to plot.")
+        features = [column for column in numeric if column != target]
+        if features:
+            feature = st.selectbox("Numeric feature to compare with target", features, key=f"{key}_reg_feature")
+            sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, (feature, target))
+            sample = sample.rename(columns={feature: "x", target: "y"}).dropna()
+            if len(sample):
+                st.altair_chart(_scatter_chart(sample, "x", "y", None, f"{feature} vs {target}"), width="stretch", key=f"{key}_reg_scatter")
+                st.caption("How to read: look for a trend, curvature, changing spread, and extreme points. This association is exploratory and does not establish causation.")
+        else:
+            st.info("No other numeric feature is available for a feature-versus-target plot.")
+
+
 def render_eda(frame: pd.DataFrame, target: str | None, task: str | None, key: str) -> None:
     st.markdown("#### Exploratory data analysis")
     profile = _eda_profile(frame.attrs.get("mlstudio_cache_key", key), frame)
@@ -924,17 +1124,11 @@ def render_eda(frame: pd.DataFrame, target: str | None, task: str | None, key: s
     c2.metric("Columns", f"{len(frame.columns):,}")
     c3.metric("Missing cells", f"{profile['missing_cells']:,}")
     c4.metric("Duplicate rows", f"{profile['duplicates']:,}")
-    st.caption("Uploads are read in memory and are not saved by this app.")
-    if profile["sampled"]:
-        st.caption("Summary statistics and correlations use a reproducible sample of up to 50,000 rows; distribution charts use up to 100,000 rows for speed.")
+    st.caption("Uploads are kept in session memory only. Distribution and relationship charts use a repeatable sample of up to 5,000 rows.")
 
     warnings_to_show = []
     if len(frame) > MAX_SLOW_KERNEL_ROWS:
-        warnings_to_show.append(
-            f"Free-tier runtime limits: kernel SVM/SVR up to {MAX_SLOW_KERNEL_ROWS:,} training rows, KNN up to {MAX_NEIGHBOR_ROWS:,}, "
-            f"DBSCAN/Local Outlier Factor up to {MAX_DENSITY_MODEL_ROWS:,}, and Agglomerative Clustering up to {MAX_AGGLOMERATIVE_ROWS:,}. "
-            "Use a smaller teaching sample or choose a faster model if a limit is reached."
-        )
+        warnings_to_show.append(f"Free-tier runtime limits: kernel SVM/SVR up to {MAX_SLOW_KERNEL_ROWS:,} training rows, KNN up to {MAX_NEIGHBOR_ROWS:,}, DBSCAN/Local Outlier Factor up to {MAX_DENSITY_MODEL_ROWS:,}, and Agglomerative Clustering up to {MAX_AGGLOMERATIVE_ROWS:,}.")
     missing_columns = profile["schema"].loc[profile["schema"]["Missing %"] >= 30, "Column"].tolist()
     if missing_columns:
         warnings_to_show.append(f"High missingness (30% or more): {', '.join(map(str, missing_columns[:8]))}.")
@@ -942,11 +1136,11 @@ def render_eda(frame: pd.DataFrame, target: str | None, task: str | None, key: s
         warnings_to_show.append(f"Constant columns carry no variation: {', '.join(map(str, profile['constants'][:8]))}.")
     if profile["likely_ids"]:
         warnings_to_show.append(f"Possible identifiers: {', '.join(map(str, profile['likely_ids'][:8]))}. Check whether to exclude them from features.")
-    numeric = frame.select_dtypes(include=np.number)
-    infinite_cells = int(np.isinf(numeric.to_numpy()).sum()) if not numeric.empty else 0
+    numeric_frame = frame.select_dtypes(include=np.number)
+    infinite_cells = int(np.isinf(numeric_frame.to_numpy()).sum()) if not numeric_frame.empty else 0
     if infinite_cells:
         warnings_to_show.append(f"Found {infinite_cells:,} infinite numeric values; preprocessing treats them as missing.")
-    if target:
+    if target and target in frame:
         missing_target = int(frame[target].isna().sum())
         if missing_target:
             warnings_to_show.append(f"{missing_target:,} rows have no target and will be left out of supervised training.")
@@ -960,55 +1154,188 @@ def render_eda(frame: pd.DataFrame, target: str | None, task: str | None, key: s
                 st.warning(note)
     if task in ("Classification", "Regression"):
         st.info("Teaching note: the app splits rows before learning imputers, encoders, and scalers. Keep the test set untouched until the final evaluation to avoid data leakage.")
-        st.caption("Runs use the seed selected in the settings below. Keep the seed and model settings to repeat a run.")
 
-    with st.expander("Questions for students"):
-        st.markdown("- Which columns have missing values, duplicates, or almost no variation?")
-        st.markdown("- Could any identifier or target-related field give the model an unfair shortcut?")
-        if task == "Classification":
-            st.markdown("- Are all classes similarly common? Which class would accuracy hide?")
-        elif task == "Regression":
-            st.markdown("- Are the feature/target patterns roughly linear? Are there extreme values?")
-        elif task == "Clustering":
-            st.markdown("- What similarity does the chosen feature scaling imply? Do the groups make sense in context?")
-        elif task == "Anomaly detection":
-            st.markdown("- Are flagged rows true data problems, rare valid cases, or simply unusual measurements?")
-
-    with st.expander("Preview and column details", expanded=True):
+    numeric = list(frame.select_dtypes(include=np.number).columns)
+    categorical = [column for column in frame.columns if column not in numeric]
+    view = st.radio("EDA view", ["Guided walkthrough", "Explore dataset"], horizontal=True, key=f"{key}_view")
+    with st.expander("Preview and column details"):
         st.dataframe(frame.head(100), width="stretch")
         st.dataframe(profile["schema"], hide_index=True, width="stretch")
         st.dataframe(profile["summary"], width="stretch")
 
-    numeric_columns = list(frame.select_dtypes(include=np.number).columns)
-    categorical_columns = [column for column in frame.columns if column not in numeric_columns]
-    left, right = st.columns(2)
-    with left:
-        st.markdown("**Numeric distribution**")
-        if numeric_columns:
-            column = st.selectbox("Numeric column", numeric_columns, key=f"{key}_numeric_chart")
-            chart = _numeric_histogram(frame.attrs.get("mlstudio_cache_key", key), frame, column)
-            if not chart.empty:
-                st.bar_chart(chart)
+    if view == "Guided walkthrough":
+        st.markdown("##### 1. Check missing data")
+        _render_missingness(frame, f"{key}_missing")
+        st.markdown("##### 2. Inspect distributions")
+        left, right = st.columns(2)
+        with left:
+            if numeric:
+                column = st.selectbox("Numeric column", numeric, key=f"{key}_guided_num")
+                sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, (column,))
+                bins = histogram_data(sample, column)
+                if bins.empty:
+                    st.info("This column has no finite numeric values to plot.")
+                else:
+                    st.altair_chart(_histogram_chart(bins, column), width="stretch", key=f"{key}_guided_hist")
+                    st.caption("How to read: shape, skew, gaps, and outliers can reveal data issues or useful transformations. What would you check before modeling?")
+            else:
+                st.info("No numeric columns are available for a histogram.")
+        with right:
+            if categorical:
+                column = st.selectbox("Categorical column", categorical, key=f"{key}_guided_cat")
+                sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, (column,))
+                counts = category_count_data(sample, column)
+                chart = alt.Chart(counts).mark_bar().encode(
+                    x=alt.X("category:N", sort="-y", title=column), y=alt.Y("rows:Q", title="Rows"),
+                    tooltip=["category:N", "rows:Q"], color=alt.Color("category:N", legend=None),
+                ).properties(height=280)
+                st.altair_chart(chart, width="stretch", key=f"{key}_guided_counts")
+                st.caption("How to read: bars show common categories; rare categories are grouped as Other. Are any groups too small to evaluate reliably?")
+            else:
+                st.info("No categorical columns are available for category counts.")
+        st.markdown("##### 3. Compare numeric relationships")
+        if len(numeric) >= 2:
+            _render_correlation(frame, numeric[:12], f"{key}_guided_corr", 360)
+            st.caption("Discussion: which pair is most strongly associated, and what other explanation could produce that pattern?")
         else:
-            st.info("No numeric columns to plot.")
-    with right:
-        st.markdown("**Category counts**")
-        if categorical_columns:
-            column = st.selectbox("Categorical column", categorical_columns, key=f"{key}_category_chart")
-            counts = _category_counts(frame.attrs.get("mlstudio_cache_key", key), frame, column)
-            st.bar_chart(counts)
+            st.info("At least two numeric columns are needed for a correlation heatmap.")
+        _render_target_charts(frame, target, task, numeric, categorical, f"{key}_guided_target")
+        if task in ("Classification", "Regression"):
+            st.caption("EDA relationships help form questions; they do not establish causation or reveal how a trained model will perform.")
+        with st.expander("Questions for students"):
+            st.markdown("- Which columns have missing values, duplicates, or almost no variation?")
+            st.markdown("- Could an identifier or target-related field give the model an unfair shortcut?")
+            st.markdown("- How might imbalance, outliers, or skew change your choice of model or metric?")
+    else:
+        st.markdown("##### Explore distributions and missingness")
+        left, right = st.columns(2)
+        with left:
+            if numeric:
+                column = st.selectbox("Numeric column", numeric, key=f"{key}_explore_numeric")
+                bins = st.slider("Histogram bins", 5, 50, 20, key=f"{key}_explore_bins")
+                kind = st.radio("Distribution chart", ["Histogram", "Boxplot"], horizontal=True, key=f"{key}_explore_dist")
+                sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, (column,))
+                if kind == "Histogram":
+                    histogram = histogram_data(sample, column, bins)
+                    if histogram.empty:
+                        st.info("This column has no finite numeric values to plot.")
+                    else:
+                        st.altair_chart(_histogram_chart(histogram, column), width="stretch", key=f"{key}_explore_hist")
+                else:
+                    data = sample.rename(columns={column: "value"}).dropna()
+                    if data.empty:
+                        st.info("This column has no finite numeric values to plot.")
+                    else:
+                        chart = alt.Chart(data).mark_boxplot().encode(y=alt.Y("value:Q", title=column), tooltip=[alt.Tooltip("value:Q", format=".3g")]).properties(height=280)
+                        st.altair_chart(chart, width="stretch", key=f"{key}_explore_box")
+            else:
+                st.info("No numeric columns are available for distribution charts.")
+        with right:
+            if categorical:
+                column = st.selectbox("Categorical column", categorical, key=f"{key}_explore_category")
+                sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, (column,))
+                counts = category_count_data(sample, column)
+                chart = alt.Chart(counts).mark_bar().encode(
+                    x=alt.X("category:N", sort="-y", title=column), y=alt.Y("rows:Q", title="Rows"),
+                    tooltip=["category:N", "rows:Q"], color=alt.Color("category:N", legend=None),
+                ).properties(height=280)
+                st.altair_chart(chart, width="stretch", key=f"{key}_explore_counts")
+            else:
+                st.info("No categorical columns are available for category counts.")
+        if frame.isna().any().any():
+            missing_columns = st.multiselect("Columns in missingness pattern (up to 20)", list(frame.columns), default=list(frame.columns[:min(12, len(frame.columns))]), max_selections=MAX_CORRELATION_COLUMNS, key=f"{key}_missing_columns")
+            sampled_pattern = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, tuple(missing_columns), MAX_MISSINGNESS_PLOT_ROWS)
+            pattern = missingness_pattern_data(sampled_pattern, missing_columns)
+            if not pattern.empty:
+                chart = alt.Chart(pattern).mark_rect().encode(
+                    x=alt.X("column:O", title=None), y=alt.Y("row:O", title="Sampled row", axis=None),
+                    color=alt.Color("missing:N", scale=alt.Scale(domain=["False", "True"], range=["#dbeafe", "#ef4444"]), title="Missing"),
+                    tooltip=["row:O", "column:O", "missing:N"],
+                ).properties(height=240)
+                st.altair_chart(chart, width="stretch", key=f"{key}_missing_pattern")
+                st.caption("How to read: this sampled matrix shows missing cells in red. Patterns can suggest shared collection or recording issues.")
+            else:
+                st.info("Select one or more columns to show the missingness pattern.")
         else:
-            st.info("No categorical columns to plot.")
+            st.success("No missing values found; a missingness pattern chart is not needed.")
 
-    if numeric_columns:
-        st.markdown("**Numeric correlations**")
-        st.dataframe(profile["correlations"], width="stretch")
-    if target and target in frame.columns:
-        st.markdown(f"**Target: {target}**")
-        if task == "Classification":
-            st.bar_chart(_category_counts(frame.attrs.get("mlstudio_cache_key", key), frame, target))
-        elif task == "Regression":
-            st.bar_chart(_numeric_histogram(frame.attrs.get("mlstudio_cache_key", key), frame, target))
+        st.markdown("##### Correlation heatmap")
+        if numeric:
+            default_corr = numeric[:min(12, len(numeric))]
+            corr_columns = st.multiselect("Numeric columns (up to 20)", numeric, default=default_corr, max_selections=MAX_CORRELATION_COLUMNS, key=f"{key}_corr_columns")
+            _render_correlation(frame, corr_columns, f"{key}_explore_corr")
+        else:
+            st.info("No numeric columns are available for correlations.")
+
+        st.markdown("##### Relationships")
+        relation_types = []
+        if len(numeric) >= 2:
+            relation_types.append("Numeric vs numeric")
+        if numeric and categorical:
+            relation_types.append("Numeric by category")
+        if len(categorical) >= 2:
+            relation_types.append("Category vs category")
+        if relation_types:
+            relation = st.selectbox("Relationship view", relation_types, key=f"{key}_relationship_type")
+            if relation == "Numeric vs numeric":
+                axes = st.columns(2)
+                x_column = axes[0].selectbox("X numeric", numeric, key=f"{key}_scatter_x")
+                y_options = [column for column in numeric if column != x_column] or numeric
+                y_column = axes[1].selectbox("Y numeric", y_options, key=f"{key}_scatter_y")
+                sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, (x_column, y_column)).dropna()
+                data = sample.rename(columns={x_column: "x", y_column: "y"})
+                st.altair_chart(_scatter_chart(data, "x", "y", None, "Numeric relationship"), width="stretch", key=f"{key}_relation_scatter")
+                st.caption("Look for direction, form, spread, and unusual points. A relationship does not establish causation.")
+            elif relation == "Numeric by category":
+                axes = st.columns(2)
+                value_column = axes[0].selectbox("Numeric value", numeric, key=f"{key}_box_numeric")
+                category_column = axes[1].selectbox("Category", categorical, key=f"{key}_box_category")
+                sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, (value_column, category_column))
+                data = numeric_category_sample(sample, value_column, category_column)
+                if data.empty:
+                    st.info("No finite numeric values are available for this comparison.")
+                else:
+                    chart = alt.Chart(data).mark_boxplot().encode(
+                        x=alt.X("category:N", title=category_column), y=alt.Y("value:Q", title=value_column),
+                        color=alt.Color("category:N", legend=None), tooltip=["category:N", alt.Tooltip("value:Q", format=".3g")],
+                    ).properties(height=320)
+                    st.altair_chart(chart, width="stretch", key=f"{key}_relation_box")
+                    st.caption("Compare medians, spread, and outliers across the ten most common categories; remaining categories are grouped. These differences are descriptive, not causal.")
+            else:
+                axes = st.columns(2)
+                x_column = axes[0].selectbox("First category", categorical, key=f"{key}_cat_x")
+                y_options = [column for column in categorical if column != x_column] or categorical
+                y_column = axes[1].selectbox("Second category", y_options, key=f"{key}_cat_y")
+                sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, (x_column, y_column))
+                data = category_relationship_data(sample, x_column, y_column)
+                chart = alt.Chart(data).mark_rect().encode(
+                    x=alt.X("x:O", title=x_column), y=alt.Y("y:O", title=y_column),
+                    color=alt.Color("rows:Q", title="Rows"), tooltip=["x:O", "y:O", "rows:Q"],
+                ).properties(height=320)
+                st.altair_chart(chart, width="stretch", key=f"{key}_relation_categories")
+                st.caption("Color shows row counts for category combinations; each variable is reduced to its ten most common values plus Other.")
+        else:
+            st.info("A relationship plot needs two numeric columns, or at least one numeric and one categorical column, or two categorical columns.")
+
+        _render_target_charts(frame, target, task, numeric, categorical, f"{key}_explore_target")
+        if len(numeric) >= 2:
+            if st.checkbox("Enable pairwise numeric exploration (optional)", value=False, key=f"{key}_pair_enabled"):
+                chosen = st.multiselect("Choose up to four numeric columns", numeric, default=numeric[:min(3, len(numeric))], max_selections=4, key=f"{key}_pair_columns")
+                pairs = pairwise_pairs(chosen)
+                if not pairs:
+                    st.info("Choose at least two numeric columns to make pairwise scatterplots.")
+                else:
+                    st.caption(f"Each plot uses the same repeatable sample of at most {MAX_PAIRWISE_PLOT_ROWS:,} rows. Up to six pair plots are shown.")
+                    sample = _eda_sample(frame.attrs.get("mlstudio_cache_key", key), frame, tuple(chosen), MAX_PAIRWISE_PLOT_ROWS)
+                    for start in range(0, len(pairs), 2):
+                        cols = st.columns(2)
+                        for slot, (x_column, y_column) in zip(cols, pairs[start:start + 2]):
+                            data = sample[[x_column, y_column]].dropna().rename(columns={x_column: "x", y_column: "y"})
+                            if data.empty:
+                                slot.info(f"{x_column} and {y_column} have no overlapping finite values.")
+                            else:
+                                slot.altair_chart(_scatter_chart(data, "x", "y", None, f"{x_column} vs {y_column}", 260), width="stretch", key=f"{key}_pair_{start}_{x_column}_{y_column}")
+                    st.caption("Patterns can be nonlinear or driven by another variable. Visual association does not establish causation.")
 
 
 def render_results(dataset_name: str, bundles: list[dict], key_prefix: str) -> list[dict]:
@@ -1034,29 +1361,111 @@ def render_results(dataset_name: str, bundles: list[dict], key_prefix: str) -> l
                     st.caption("Known labels were excluded from the clustering inputs. ARI is chance-adjusted (1 is perfect, near 0 is chance, and it can be negative); NMI is not chance-adjusted.")
                 if "confusion_matrix" in result["details"]:
                     st.markdown("**Confusion matrix**")
-                    st.dataframe(result["details"]["confusion_matrix"], width="stretch")
+                    matrix = result["details"]["confusion_matrix"]
+                    if len(matrix) <= 30:
+                        matrix_data = pd.DataFrame(
+                            [(str(actual), str(predicted), int(matrix.loc[actual, predicted])) for actual in matrix.index for predicted in matrix.columns],
+                            columns=["Actual", "Predicted", "Rows"],
+                        )
+                        heat = alt.Chart(matrix_data).mark_rect().encode(
+                            x=alt.X("Predicted:O", title="Predicted class"), y=alt.Y("Actual:O", title="Actual class"),
+                            color=alt.Color("Rows:Q", title="Rows", scale=alt.Scale(scheme="blues")),
+                            tooltip=["Actual:O", "Predicted:O", "Rows:Q"],
+                        ).properties(height=min(500, max(260, 28 * len(matrix))))
+                        st.altair_chart(heat, width="stretch", key=f"{key_prefix}_cm_{len(flattened)}")
+                        st.caption("How to read: the diagonal is correct predictions; off-diagonal cells show which classes are confused. Compare errors by class, not only the total.")
+                    else:
+                        st.info("There are more than 30 classes, so the matrix is shown as a table to keep labels readable.")
+                    st.dataframe(matrix, width="stretch")
                     st.markdown("**Per-class precision, recall, and F1**")
-                    st.dataframe(result["details"]["classification_report"], width="stretch")
+                    report = result["details"]["classification_report"]
+                    st.dataframe(report, width="stretch")
+                    class_report = report.drop(index=[name for name in ("accuracy", "macro avg", "weighted avg") if name in report.index], errors="ignore")
+                    if not class_report.empty:
+                        recall_data = class_report.reset_index(names="Class")
+                        recall_chart = alt.Chart(recall_data).mark_bar().encode(
+                            x=alt.X("recall:Q", title="Recall", scale=alt.Scale(domain=[0, 1])),
+                            y=alt.Y("Class:N", sort="-x", title=None), color=alt.Color("recall:Q", legend=None),
+                            tooltip=["Class:N", alt.Tooltip("recall:Q", format=".3f")],
+                        ).properties(height=min(420, 28 * len(recall_data) + 30))
+                        st.altair_chart(recall_chart, width="stretch", key=f"{key_prefix}_recall_{len(flattened)}")
+                        st.caption("How to read: recall is the share of actual examples of a class that were found. Low recall means many examples of that class were missed.")
                 if "Train accuracy" in result["metrics"] or "Train R²" in result["metrics"]:
                     st.caption("Train scores describe fit to examples the model saw. Test scores estimate performance on held-out examples. A large gap can indicate overfitting.")
                 output = result["details"].get("output")
                 if "explained_variance" in result["details"]:
-                    st.markdown("**Variance retained by each PCA component**")
-                    st.bar_chart(result["details"]["explained_variance"])
+                    variance = result["details"]["explained_variance"]
+                    st.markdown("**PCA variance retained**")
+                    bars = alt.Chart(variance).mark_bar(color="#4878cf").encode(
+                        x=alt.X("Component:O", title="Component"), y=alt.Y("Explained variance ratio:Q", title="Variance ratio"),
+                        tooltip=["Component:O", alt.Tooltip("Explained variance ratio:Q", format=".3f"), alt.Tooltip("Cumulative variance:Q", format=".3f")],
+                    )
+                    line = alt.Chart(variance).mark_line(color="#d94841", point=True).encode(
+                        x=alt.X("Component:O"), y=alt.Y("Cumulative variance:Q", title="Cumulative variance", scale=alt.Scale(domain=[0, 1])),
+                    )
+                    st.altair_chart(alt.layer(bars, line).resolve_scale(y="independent").properties(height=300), width="stretch", key=f"{key_prefix}_pca_variance_{len(flattened)}")
+                    st.caption("Bars show the variance share in each component; the red line shows cumulative variance. Retained variance measures compression, not predictive accuracy.")
                 if output is not None:
                     output_rows = result["details"].get("output_rows", len(output))
                     if output_rows > len(output):
                         st.caption(f"Showing a repeatable sample of {len(output):,} of {output_rows:,} result rows. Download the full file below.")
                     st.dataframe(output.head(100), width="stretch")
-                    scatter_columns = result["details"].get("scatter_columns")
-                    color_column = "Cluster" if "Cluster" in output.columns else "Result" if "Result" in output.columns else None
-                    if scatter_columns and color_column:
-                        st.scatter_chart(output, x=scatter_columns[0], y=scatter_columns[1], color=color_column)
+                    if {"Actual", "Predicted"}.issubset(output.columns):
+                        actual = output[["Actual", "Predicted"]].apply(pd.to_numeric, errors="coerce").dropna()
+                        if not actual.empty:
+                            low = float(actual.min().min())
+                            high = float(actual.max().max())
+                            points = alt.Chart(actual).mark_circle(size=45, opacity=0.6).encode(
+                                x=alt.X("Actual:Q", title="Actual"), y=alt.Y("Predicted:Q", title="Predicted"),
+                                tooltip=[alt.Tooltip("Actual:Q", format=".3g"), alt.Tooltip("Predicted:Q", format=".3g")],
+                            )
+                            reference = alt.Chart(pd.DataFrame({"Actual": [low, high], "Predicted": [low, high]})).mark_line(color="#d94841", strokeDash=[5, 4]).encode(x="Actual:Q", y="Predicted:Q")
+                            st.markdown("**Actual vs predicted**")
+                            st.altair_chart(alt.layer(points, reference).properties(height=320), width="stretch", key=f"{key_prefix}_actual_pred_{len(flattened)}")
+                            st.caption("The dashed line is perfect prediction. Points farther away have larger errors; this view uses held-out rows only.")
                     if "Residual" in output.columns:
-                        st.markdown("**Residuals (actual − predicted)**")
-                        st.scatter_chart(output, x="Predicted", y="Residual")
+                        st.markdown("**Residual diagnostics (actual − predicted)**")
+                        residuals = output[["Predicted", "Residual"]].apply(pd.to_numeric, errors="coerce").dropna()
+                        if not residuals.empty:
+                            left, right = st.columns(2)
+                            residual_data = histogram_data(output, "Residual", bins=25)
+                            left.altair_chart(_histogram_chart(residual_data, "Residual", 260), width="stretch", key=f"{key_prefix}_resid_hist_{len(flattened)}")
+                            right.altair_chart(_scatter_chart(residuals.rename(columns={"Predicted": "x", "Residual": "y"}), "x", "y", None, "Residual vs predicted", 260), width="stretch", key=f"{key_prefix}_resid_scatter_{len(flattened)}")
+                            st.caption("A centered residual distribution is useful; curves or changing spread in residual-vs-predicted plots can reveal a missed pattern or unequal error variance.")
+                    if "cluster_sizes" in result["details"]:
+                        sizes = result["details"]["cluster_sizes"]
+                        size_chart = alt.Chart(sizes).mark_bar().encode(
+                            x=alt.X("Rows:Q", title="Rows"), y=alt.Y("Cluster:N", sort="-x", title=None),
+                            color=alt.Color("Cluster:N", legend=None), tooltip=["Cluster:N", "Rows:Q"],
+                        ).properties(height=min(320, 35 * len(sizes) + 30))
+                        st.altair_chart(size_chart, width="stretch", key=f"{key_prefix}_cluster_sizes_{len(flattened)}")
+                        st.caption("How to read: cluster IDs are arbitrary. Check cluster sizes and context; a visual group is not automatically meaningful.")
+                    color_column = "Cluster" if "Cluster" in output.columns else "Result" if "Result" in output.columns else None
+                    if color_column:
+                        excluded = {"Original row", "Anomaly score (lower is more unusual)"}
+                        plot_columns = [column for column in output.select_dtypes(include=np.number).columns if column not in excluded]
+                        if len(plot_columns) >= 2:
+                            axes = st.columns(2)
+                            x_column = axes[0].selectbox("Plot X feature", plot_columns, key=f"{key_prefix}_result_x_{len(flattened)}")
+                            y_options = [column for column in plot_columns if column != x_column] or plot_columns
+                            y_column = axes[1].selectbox("Plot Y feature", y_options, key=f"{key_prefix}_result_y_{len(flattened)}")
+                            scatter = output[[x_column, y_column, color_column]].dropna().rename(columns={x_column: "x", y_column: "y"})
+                            st.altair_chart(_scatter_chart(scatter, "x", "y", color_column, "Two-feature projection"), width="stretch", key=f"{key_prefix}_cluster_scatter_{len(flattened)}")
+                            st.caption("Illustrative two-feature view: the model may have used more columns and dimensions. This projection is not a full measure of clustering quality.")
+                    if "Anomaly score (lower is more unusual)" in output.columns:
+                        st.markdown("**Anomaly score distribution**")
+                        scores = output[["Anomaly score (lower is more unusual)", "Result"]].dropna().rename(columns={"Anomaly score (lower is more unusual)": "score"})
+                        score_chart = alt.Chart(scores).mark_bar(opacity=0.7).encode(
+                            x=alt.X("score:Q", bin=alt.Bin(maxbins=30), title="Score (lower is more unusual)"),
+                            y=alt.Y("count():Q", title="Rows"), color=alt.Color("Result:N", title="Flag"),
+                            tooltip=["Result:N", alt.Tooltip("count():Q", title="Rows")],
+                        ).properties(height=300)
+                        st.altair_chart(score_chart, width="stretch", key=f"{key_prefix}_anomaly_hist_{len(flattened)}")
+                        st.caption("The score is a ranking signal, not a probability. Lower scores are more unusual; flagged status depends on the selected contamination setting.")
                     if {"PC1", "PC2"}.issubset(output.columns):
-                        st.scatter_chart(output, x="PC1", y="PC2")
+                        pc_data = output[["PC1", "PC2"]].dropna()
+                        st.altair_chart(_scatter_chart(pc_data, "PC1", "PC2", None, "First two principal components"), width="stretch", key=f"{key_prefix}_pca_scatter_{len(flattened)}")
+                        st.caption("This is a two-component projection. It can hide structure in later components and does not measure predictive performance.")
                     download_data = result["details"].get("download_data")
                     if download_data is None:
                         download_data = output.to_csv(index=False).encode("utf-8")

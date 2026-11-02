@@ -197,6 +197,52 @@ class MLStudioWorkflowTests(unittest.TestCase):
         )
         self.assertIn("limited to", bundles[0]["results"][0]["error"])
 
+    def test_eda_summaries_and_bounded_chart_data(self):
+        frame = pd.DataFrame({
+            "number": np.arange(250),
+            "group": [f"category-{i % 15}" for i in range(250)],
+            "empty": [None if i % 3 == 0 else i for i in range(250)],
+        })
+        missing = app.missingness_summary(frame).set_index("Column")
+        self.assertEqual(missing.loc["empty", "Missing rows"], 84)
+        self.assertAlmostEqual(missing.loc["empty", "Missing %"], 33.6)
+
+        histogram = app.histogram_data(frame, "number", bins=7, limit=40)
+        self.assertEqual(len(histogram), 7)
+        self.assertEqual(histogram["rows"].sum(), 40)
+        pd.testing.assert_frame_equal(histogram, app.histogram_data(frame, "number", bins=7, limit=40))
+
+        categories = app.category_count_data(frame, "group", limit=10)
+        self.assertEqual(len(categories), 11)
+        self.assertEqual(categories.loc[categories["category"] == "Other categories", "rows"].iloc[0], 80)
+
+    def test_eda_relationship_limits_and_empty_inputs(self):
+        frame = pd.DataFrame({f"n{i}": np.arange(120) + i for i in range(22)})
+        correlations = app.correlation_data(frame, list(frame.columns))
+        self.assertEqual(correlations["x"].nunique(), app.MAX_CORRELATION_COLUMNS)
+        self.assertEqual(correlations["y"].nunique(), app.MAX_CORRELATION_COLUMNS)
+        self.assertEqual(len(correlations), app.MAX_CORRELATION_COLUMNS ** 2)
+
+        patterned = frame.assign(group=[f"g{i % 12}" for i in range(len(frame))])
+        missing_pattern = app.missingness_pattern_data(patterned, list(patterned.columns))
+        self.assertEqual(missing_pattern["row"].nunique(), app.MAX_MISSINGNESS_PLOT_ROWS)
+        self.assertEqual(missing_pattern["column"].nunique(), app.MAX_CORRELATION_COLUMNS)
+        self.assertEqual(len(missing_pattern), app.MAX_MISSINGNESS_PLOT_ROWS * app.MAX_CORRELATION_COLUMNS)
+
+        pairs = app.pairwise_pairs(["a", "b", "c", "d"])
+        self.assertEqual(len(pairs), 6)
+        with self.assertRaisesRegex(ValueError, "at most four"):
+            app.pairwise_pairs(["a", "b", "c", "d", "e"])
+
+        large = pd.DataFrame({"x": np.arange(3_000), "y": np.arange(3_000) ** 2})
+        pair_sample = app.bounded_frame_sample(large, ("x", "y"), app.MAX_PAIRWISE_PLOT_ROWS)
+        self.assertEqual(len(pair_sample), app.MAX_PAIRWISE_PLOT_ROWS)
+        pd.testing.assert_frame_equal(pair_sample, app.bounded_frame_sample(large, ("x", "y"), app.MAX_PAIRWISE_PLOT_ROWS))
+
+        relation = app.category_relationship_data(patterned, "group", "n0", row_limit=25)
+        self.assertLessEqual(int(relation["rows"].sum()), 25)
+        self.assertTrue(app.correlation_data(pd.DataFrame({"only": [1, 2]}), ["only"]).empty)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,5 @@
 import unittest
+import hashlib
 from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
@@ -59,6 +60,49 @@ class StreamlitInterfaceTests(unittest.TestCase):
         at.button(key="reset_session").click().run()
         self.assertEqual(len(at.exception), 0)
         self.assertEqual(at.radio(key="workspace").value, "Single dataset")
+
+    def test_explore_eda_for_numeric_categorical_mixed_and_unlabeled_csvs(self):
+        examples = {
+            "numeric": b"x,y\n" + b"".join(f"{i},{i * 2}\n".encode() for i in range(40)),
+            "categorical": b"group\n" + b"".join(f"g{i % 4}\n".encode() for i in range(40)),
+            "mixed_missing": b"measure,group,label\n" + b"".join(
+                f"{'' if i % 9 == 0 else i / 10},{'a' if i % 2 else 'b'},{'yes' if i % 2 else 'no'}\n".encode()
+                for i in range(60)
+            ),
+            "high_cardinality": b"measure,identifier\n" + b"".join(f"{i % 7},{'id-' + str(i)}\n".encode() for i in range(60)),
+        }
+        for name, payload in examples.items():
+            with self.subTest(dataset=name):
+                at = self.fresh_app()
+                at.file_uploader(key="single_upload").set_value([(f"{name}.csv", payload, "text/csv")]).run()
+                dataset_key = hashlib.sha256(payload).hexdigest()[:16]
+                eda_key = f"single_eda_{dataset_key}_view"
+                at.radio(key=eda_key).set_value("Explore dataset").run()
+                self.assertEqual(len(at.exception), 0)
+                self.assertEqual(len(at.error), 0)
+                self.assertEqual(at.radio(key=eda_key).value, "Explore dataset")
+                if name == "numeric":
+                    at.checkbox(key=f"single_eda_{dataset_key}_pair_enabled").set_value(True).run()
+                    self.assertEqual(len(at.exception), 0)
+
+    def test_classification_and_regression_target_plots(self):
+        classification = b"signal,category,label\n" + b"".join(
+            f"{i / 10},{'a' if i % 2 else 'b'},{'yes' if i % 2 else 'no'}\n".encode()
+            for i in range(60)
+        )
+        at = self.fresh_app()
+        at.file_uploader(key="single_upload").set_value([("classes.csv", classification, "text/csv")]).run()
+        class_key = hashlib.sha256(classification).hexdigest()[:16]
+        at.selectbox(key=f"single_target_{class_key}").set_value("label").run()
+        self.assertEqual(len(at.exception), 0)
+
+        regression = b"signal,target\n" + b"".join(f"{i},{i * 3.5}\n".encode() for i in range(60))
+        at = self.fresh_app()
+        at.file_uploader(key="single_upload").set_value([("regression.csv", regression, "text/csv")]).run()
+        at.selectbox(key="single_task").set_value("Regression").run()
+        regression_key = hashlib.sha256(regression).hexdigest()[:16]
+        at.selectbox(key=f"single_target_{regression_key}").set_value("target").run()
+        self.assertEqual(len(at.exception), 0)
 
 
 if __name__ == "__main__":

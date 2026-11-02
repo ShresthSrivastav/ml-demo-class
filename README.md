@@ -4,11 +4,12 @@ A teaching app for exploring tabular data, learning common machine-learning work
 
 ## Features
 
-- Upload a CSV and explore its shape, column types, missing values, duplicates, summary statistics, distributions, correlations, and target balance.
+- Upload a CSV and follow a guided EDA walkthrough or explore it interactively with distribution, missingness, correlation, numeric/categorical relationship, and target plots.
+- Sample charts reproducibly at up to 5,000 rows; pairwise numeric plots are optional and capped at 2,000 rows and four columns. Category relationship views show the ten most common levels plus an "Other" group.
 - Get data-quality flags for likely identifiers, constant columns, high missingness, class imbalance, and infinite numeric values.
 - Choose automatic or manual input features and configure supervised targets.
-- Train common classification and regression models, compare them with a baseline, and inspect holdout metrics, confusion matrices, per-class scores, or residuals.
-- Run clustering, PCA, and anomaly detection with relevant metrics, plots, and row-level outputs.
+- Train common classification and regression models, compare them with a baseline, and inspect holdout metrics, confusion-matrix heatmaps, per-class recall, actual-versus-predicted, and residual plots.
+- Run clustering, PCA, and anomaly detection with cluster-size and two-feature views, explained-variance charts, anomaly-score distributions, metrics, and row-level outputs. Projection plots are illustrative and may hide dimensions used by the model.
 - Optionally run up to five-fold cross-validation or permutation importance on a bounded sample.
 - Compare model results within each dataset, or use one compatible model across datasets. Scores are displayed per dataset and are never averaged across datasets.
 - Use five built-in learning examples with teaching notes and student exercises.
